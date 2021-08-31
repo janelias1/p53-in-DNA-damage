@@ -1,0 +1,383 @@
+// -----------------------------------------------------------------------
+//
+// Mathematical model of p53
+// For the Special Issue "The Functional Landscape of p53"
+// in International Journal of Molecular Sciences
+// (Eds. Andreas Prokesch and Jelena Krstic)
+// By Jan Elias and Cicely K. Macnamara
+// Date: 23.07.2021
+//
+// Simple p53-Mdm2 negative feedback + Mdm2 mRNA intermediary + 2D space
+//
+// Problem solved by the Rothe method: equations are first decouplen into
+// linear equations and then solved by a finite element method (FEM)
+//
+// This is a FreeFem++ script, to run the script, please visit
+// https://freefem.org and download the latest version of FreeFem++
+//
+// Output: data at specific time points saved as .sol file,
+// A generated mesh of the cell is saved in .msh file
+//
+// Use code_04_FFtoMatlab_2D_viso.m to visualise numerical solution given
+// by this FF++ code in Matlab. In the matlab code it is necessary to
+// specify the exact paths to the files produced by this FF++ code
+// -----------------------------------------------------------------------
+// -----------------------------------------------------------------------
+
+
+
+load "medit"
+load "lapack"
+
+
+
+// -----------------------------------------------------------------------
+// ----------------------------- macros ----------------------------------
+// Define gradient
+
+macro Grad(u) [dx(u),dy(u)] //
+
+
+
+// ----------------------- constants settings ----------------------------
+
+real dt=0.02; // time step
+real T = 30.01; // final time, equations are solved on the time interval (0,T]
+
+real tempo = 0.1; // a frequency of how often the data are solved, i.e., data
+                  // are saved when the time is 0.1, 0.2, 0.3 etc.
+                  // Note: this frequency must be a multiple of dt
+
+
+real errc, errn, toll=1e-4; // constants for saving errors in numerical
+                            // computation for the subsequent iterations
+                            // in the time discretisation
+real [int] errtot(2);
+
+
+int iter, maxiter = 20; // number of iterations and maximal number of allowed
+                        // iteration in every time step of computation
+
+
+string numb, numb2; int pos; // some constants that help to determine whether t = tempo
+
+
+real p53totalN, Mdm2totalN, Mdm2RNAtotalN; // concentrations in the nucleus
+real p53totalC, Mdm2totalC, Mdm2RNAtotalC; // concentrations in the cytoplasm
+real p53DNA; // p53 in the DNA locus
+
+
+real L=10.0; // reference length of the cell
+
+
+// constants that define the cell structure: radii of the cell, nucleus, DNA locus and the area of mRNA translation
+real r1 = 10.0/L;
+real r2 = 3.0/L; // the volume of the nucleus is 9/100 so about 1/10 of the whole cell
+real rDNA = r2/3; // DNA locus has 1/3rd of the radius of nucleus
+real r6  =  6.0/L;
+real r5  =  5.0/L;
+// p53 basal production and Mdm2 mRNA translation occurs in the annulus of the radii 5 and 6 length units
+
+
+real Dp53 = 0.1, Dmdm2 = Dp53, Dmdm2RNA = Dp53; // diffusion of p53, Mdm2, Mdm2RNA
+real pp53 = 10.0, pmdm2 = pp53, pmRNA = pp53; // permeability of p53, Mdm2, Mdm2RNA
+
+
+real k1=5.0, K1=0.1; // p53 ubiquitination by Mdm2
+real k2=2.0, K2=1; // p53 dependent synthesis of Mdm2 - Hill
+real n = 2; // Hill coefficient in p53 dependent synthesis of Mdm2
+real ks = 2/(pi*(r6^2-r5^2)); // basal production of p53 in the cytoplasm
+real ktra=5.0; // Mdm2 translation rate
+
+
+// degradations terms : p53, Mdm2, Mdm2 mRNA
+real deltap=0.1;
+real deltam=1.0;
+real deltamrnac=0.1;
+real deltamrnan=0.0;
+
+
+// -------------------- end of constant definition -----------------------
+
+
+
+// -------------------- create a mesh of a 2D cell -----------------------
+
+int In=1; // to label nuclear membrane  
+int Ic=2; // to label cellular membrane 
+
+border Ccell(t=0,2*pi){ x=r1*cos(t); y=r1*sin(t); label=Ic;} // cellular membrane labeled as 2
+border Cnuc(t=0,2*pi){ x=r2*cos(t); y=r2*sin(t); label=In;} // nuclear membrane, labeled as 1
+
+mesh Thc = buildmesh (Ccell(100)+Cnuc(-45)); // mesh on the cytoplasm
+mesh Thn = buildmesh (Cnuc(45)); // mesh on the nucleus
+
+savemesh (Thc, "Cell2Dcyt.msh");
+savemesh (Thn, "Cell2Dnuc.msh");
+mesh Thcell2D = Thc + Thn;
+savemesh(Thcell2D,"Cell2D.msh");
+// plot(Thc,wait=1); 
+plot(Thcell2D,wait=1);
+
+func charDNA = 0.0 + 1.0*(x^2 + y^2 < rDNA^2); // DNA locus in the nucleus
+func charbas = 0.0 + 1.0*(x^2 + y^2 >= r5^2 & x^2 + y^2 <= r6^2);
+func chartra = 0.0 + 1.0*(x^2 + y^2 >= r5^2);
+fespace Vh(Thcell2D,P1); 
+        Vh DNAloc=charDNA; Vh bas=charbas; 
+        Vh trans=chartra;
+plot(DNAloc,fill=1,wait=1,ColorScheme=1,value=1,cmm="DNA locus") ;
+plot(bas,fill=1,wait=1,ColorScheme=1,value=1,cmm="Area of p53 basal production") ;
+plot(trans,fill=1,wait=1,ColorScheme=1,value=1,cmm="Area of translation") ;
+
+
+// -----------------------------------------------------------------------
+// ------------------- space of P1 functions (solution) ------------------
+fespace VhC(Thc,P1);
+fespace VhN(Thn,P1);
+
+
+// p53total Mdm2total, Mdm2RNAtotal;
+
+VhN unp53, unmdm2, unmRNA; // solution functions
+VhN vnp53, vnmdm2, vnmRNA; // test functions
+VhN unp53old, unmdm2old, unmRNAold; // solution from the previous time step
+VhN uknp53, uknp530, uknmdm2, uknmdm20, uknmRNA, uknmRNA0; // initial data + helping funtions for the Rothe method
+
+
+VhC ucp53, ucmdm2, ucmRNA; // solution functions
+VhC vcp53, vcmdm2, vcmRNA; // test functions
+VhC ucp53old, ucmdm2old, ucmRNAold; // solution from the previous time step
+VhC ukcp53, ukcp530, ukcmdm2, ukcmdm20, ukcmRNA, ukcmRNA0; // initial data + helping funtions for the Rothe method
+
+
+// --------------------- initial functions at t = 0 ---------------------
+
+real p53nucinit=0.1/(pi*r2^2);
+real p53cytinit=0.1/(pi*(r1^2-r2^2));
+real mdm2nucinit=0.05/(pi*r2^2);
+real mdm2cytinit=0.05/(pi*(r1^2-r2^2));
+real mdm2mRNAnucinit=0.1/(pi*r2^2);
+real mdm2mRNAcytinit=0.1/(pi*(r1^2-r2^2));
+
+uknp53=1e-14+p53nucinit;
+uknmdm2=1e-14+mdm2nucinit;
+uknmRNA=1e-14+mdm2mRNAnucinit;
+
+ukcp53=1e-14+p53cytinit;
+ukcmdm2=1e-14+mdm2cytinit;
+ukcmRNA=1e-14+mdm2mRNAcytinit;
+
+unp53old=uknp53; unmdm2old=uknmdm2; unmRNAold=uknmRNA;
+ucp53old=ukcp53; ucmdm2old=ukcmdm2; ucmRNAold=ukcmRNA;
+
+uknp530=uknp53; ukcp530=ukcp53;
+uknmdm20 = uknmdm2; ukcmdm20 = ukcmdm2;
+uknmRNA0 = uknmRNA; ukcmRNA0 = ukcmRNA;
+
+
+// ---------- save concentrations in nucleus and cytoplasm --------------
+// p53total, Mdm2total, Mdm2RNAtotal;
+
+p53totalN=int2d(Thn)(uknp53); p53totalC=int2d(Thc)(ukcp53);
+Mdm2totalN=int2d(Thn)(uknmdm2); Mdm2totalC=int2d(Thc)(ukcmdm2);
+Mdm2RNAtotalN=int2d(Thn)(uknmRNA); Mdm2RNAtotalC=int2d(Thc)(ukcmRNA);
+p53DNA=int2d(Thn)(uknp53*charDNA);
+
+
+ofstream hh("info_conc_cytnuc.txt"); // save nuclear/cytoplasmic concentrations into a text file
+hh << "0.0," << p53totalN << "," << p53totalC << "," << Mdm2totalN << "," << Mdm2totalC << "," << Mdm2RNAtotalN << "," << Mdm2RNAtotalC << "," << p53DNA << endl;
+
+
+// ---------------- definition of variational problem -------------------
+
+// nucleus: unp53, unmdm2, unmRNA;
+
+// p53
+problem PNp53(unp53,vnp53) =
+        int2d(Thn)( Dp53*(Grad(unp53)'*Grad(vnp53)) + unp53*vnp53/dt
+                + k1*uknmdm2*(unp53/(K1+uknp53))*vnp53
+                + deltap*unp53*vnp53)
+      - int2d(Thn)( unp53old*vnp53/dt )
+//      + int1d(Thn,In,mortar=1)( pp53*unp53*vnp53 ) // comment if flow from Cyt to Nuc only!
+      - int1d(Thn,In,mortar=1)( pp53*ucp53*vnp53 )
+;
+
+// Mdm2 mRNA
+problem PNmRNA(unmRNA,vnmRNA) =
+        int2d(Thn)( Dmdm2RNA*(Grad(unmRNA)'*Grad(vnmRNA)) + unmRNA*vnmRNA/dt 
+                + deltamrnan*unmRNA*vnmRNA
+                   )
+      - int2d(Thn)( unmRNAold*vnmRNA/dt
+                + (k2*(unp53^n/(K2^n+unp53^n))*vnmRNA)*charDNA
+		)
+      + int1d(Thn,In,mortar=1)( pmRNA*unmRNA*vnmRNA ) // from Nuc to Cyt only!
+;
+
+// Mdm2
+problem PNmdm2(unmdm2,vnmdm2) =
+        int2d(Thn)( Dmdm2*(Grad(unmdm2)'*Grad(vnmdm2)) + unmdm2*vnmdm2/dt 
+                + deltam*unmdm2*vnmdm2
+		)
+      - int2d(Thn)( unmdm2old*vnmdm2/dt )
+//      + int1d(Thn,In,mortar=1)( pmdm2*unmdm2*vnmdm2 ) // comment if unidirectional flow (Cyt. to Nuc.)
+      - int1d(Thn,In,mortar=1)( pmdm2*ucmdm2*vnmdm2 )
+;
+
+
+
+// cytoplasm: ucp53,ucmdm2,ucmRNA;
+
+// p53
+problem PCp53(ucp53,vcp53) =
+        int2d(Thc)( Dp53*(Grad(ucp53)'*Grad(vcp53)) + ucp53*vcp53/dt
+                + k1*ukcmdm2*(ucp53/(K1+ukcp53))*vcp53
+                + deltap*ucp53*vcp53
+                  )
+      - int2d(Thc)( ucp53old*vcp53/dt + ks*vcp53*charbas )
+      + int1d(Thc,In,mortar=1)( pp53*ucp53*vcp53 )
+//      - int1d(Thc,In,mortar=1)( pp53*uknp53*vcp53 ) // comment if from Cyt to Nuc only!
+;
+
+// Mdm2 mRNA
+problem PCmRNA(ucmRNA,vcmRNA) =
+        int2d(Thc)( Dmdm2RNA*(Grad(ucmRNA)'*Grad(vcmRNA)) + ucmRNA*vcmRNA/dt 
+                 + deltamrnac*ucmRNA*vcmRNA 
+                   )
+      - int2d(Thc)( ucmRNAold*vcmRNA/dt                
+		)
+      - int1d(Thc,In,mortar=1)( pmRNA*unmRNA*vcmRNA ) // from Nuc to Cyt only!
+;
+
+// Mdm2
+problem PCmdm2(ucmdm2,vcmdm2) =
+        int2d(Thc)( Dmdm2*(Grad(ucmdm2)'*Grad(vcmdm2)) + ucmdm2*vcmdm2/dt 
+                + deltam*ucmdm2*vcmdm2 
+		)
+      - int2d(Thc)( ucmdm2old*vcmdm2/dt + ktra*ucmRNA*vcmdm2*chartra
+		)
+      + int1d(Thc,In,mortar=1)( pmdm2*ucmdm2*vcmdm2 )
+//      - int1d(Thc,In,mortar=1)( pmdm2*uknmdm2*vcmdm2 ) // comment if unidirectional flow (Cyt. to Nuc.)
+;
+
+
+
+// -------- end of var. problem definition ----------
+
+
+
+// ------------------ PDE solving -------------------
+
+ofstream gg("info_errors.txt"); // contains informations about errors and number of iterations in one step
+
+real t1=0, t2=1.0;
+
+for(real t=0;t<T;t+=dt)
+{
+        iter=0; errc=100; errn=100; errtot=100;//=[errM1,errM2];
+
+        uknp53=unp53old; uknmdm2=unmdm2old; uknmRNA=unmRNAold;
+        ukcp53=ucp53old; ukcmdm2=ucmdm2old; ukcmRNA=ucmRNAold;
+
+
+	while(errtot.max>toll && iter<maxiter)
+	{
+ 
+                PCp53; PNp53; PNmRNA; PCmRNA; PCmdm2; PNmdm2;
+
+                iter++;
+
+     //  uknp53,uknp532,uknpRNA,uknATMp,uknATMd,uknC,uknmdm2,uknmdm2p,uknmRNA,uknwip1,uknwRNA
+                // L^1 error
+                errn = abs( int2d(Thn)(unp53-uknp53) )
+                     + abs( int2d(Thn)(unmdm2-uknmdm2) )
+                     + abs( int2d(Thn)(unmRNA-uknmRNA) )
+                     ;
+                errc = abs( int2d(Thc)(ucp53-ukcp53) )
+                     + abs( int2d(Thc)(ucmdm2-ukcmdm2) )
+                     + abs( int2d(Thc)(ucmRNA-ukcmRNA) )
+                     ;
+			;	
+
+
+                errtot[0]=errn; errtot[1]=errc;
+
+
+		gg << "time = " << t <<", it = "<< iter <<", errN = "<< errn <<", errC = "<< errc <<endl; 
+
+
+                uknp53=unp53; uknmdm2=unmdm2; uknmRNA=unmRNA;
+                ukcp53=ucp53; ukcmdm2=ucmdm2; ukcmRNA=ucmRNA;
+
+
+	}// eof while
+
+
+
+	if ((iter==maxiter) && (errtot.min>toll*10))
+		{
+		cout << "Max. number of allowed iterations reached!" << endl;
+		break;
+		// check the error txt file: if the convergence of the refinement is
+		// slow, then increase itermax or make toll smaller
+		}
+
+
+
+	numb = string(t/tempo); pos = numb.find("."); numb2 = numb(pos+1:numb.length);
+	
+	if ( pos == -1 ? 1 : (numb2=="0" ? 1 : 0)) //(!(t%tempo))
+	{
+
+     // p53total, Mdm2total, Mdm2RNAtotal;
+
+     p53totalN=int2d(Thn)(unp53); p53totalC=int2d(Thc)(ucp53);
+     Mdm2totalN=int2d(Thn)(unmdm2); Mdm2totalC=int2d(Thc)(ucmdm2);
+     Mdm2RNAtotalN=int2d(Thn)(unmRNA); Mdm2RNAtotalC=int2d(Thc)(ucmRNA);
+
+     p53DNA=int2d(Thn)(unp53*charDNA);
+     
+     hh << t << "," << p53totalN << "," << p53totalC << "," << Mdm2totalN << "," << Mdm2totalC << "," << Mdm2RNAtotalN << "," << Mdm2RNAtotalC << "," << p53DNA << endl;
+
+     // save data for matlab
+     savesol("p53N."+(100000+t*100)+".sol",Thn,unp53); savesol("p53C."+(100000+t*100)+".sol",Thc,ucp53);
+     savesol("Mdm2N."+(100000+t*100)+".sol",Thn,unmdm2); savesol("Mdm2C."+(100000+t*100)+".sol",Thc,ucmdm2);
+     savesol("Mdm2mRNAN."+(100000+t*100)+".sol",Thn,unmRNA); savesol("Mdm2mRNAC."+(100000+t*100)+".sol",Thc,ucmRNA);
+	
+	 } // end of if
+ 
+
+
+        unp53old=unp53; unmdm2old=unmdm2; unmRNAold=unmRNA;
+        ucp53old=ucp53; ucmdm2old=ucmdm2; ucmRNAold=ucmRNA;
+
+}
+
+
+// -----------------------------------------------------------------------
+// Display some stats:
+
+VhN uI; VhC wI;
+uI=1.0; wI=1.0; real volOM=int2d(Thn)( uI ) + int2d(Thc)( wI );
+cout << "vol(Omega) = " << volOM << endl;
+real volBP=int2d(Thc)( wI*charbas );
+cout << "vol(area of Basal Production) = " << volBP << endl;
+real volTra=int2d(Thc)( wI*chartra );
+cout << "vol(area of Translation) = " << volTra << endl;
+real volNuc= int2d(Thn)( uI );
+cout << "vol(Nucleus) = " << volNuc << endl;
+real volDNA= int2d(Thn)( uI*charDNA );
+cout << "vol(DNA locus) = " << volDNA << endl;
+real volCyt= int2d(Thc)( wI );
+cout << "vol(Cytoplasm) = " << volCyt << endl;
+real totmdm2=int2d(Thn) (uknmdm20) + int2d(Thc) (ukcmdm20);
+cout << "Mdm2 at t=0: " << totmdm2 << endl;
+real totmdm2mRNA=int2d(Thn) (uknmRNA0) + int2d(Thc) (ukcmRNA0);
+cout << "Mdm2 mRNA at t=0: " << totmdm2mRNA << endl;
+real totp53=int2d(Thn) (uknp530) + int2d(Thc) (ukcp530);
+cout << "p53 at t=0: " << totp53 << endl;
+real basp53 = int2d(Thc)( ks*wI*charbas );
+cout << "p53 protein Basal Production Rate = " << basp53 << endl;
+
+// -----------------------------------------------------------------------
+// -------------------------- end of the code ----------------------------
+// -----------------------------------------------------------------------
